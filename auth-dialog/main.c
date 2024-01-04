@@ -28,7 +28,6 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#define _GNU_SOURCE
 #include <getopt.h>
 
 #include <libxml/parser.h>
@@ -36,6 +35,11 @@
 
 #include <gtk/gtk.h>
 #include <glib-unix.h>
+
+#include <webkit2/webkit2.h>
+#include <libsoup/soup.h>
+
+#include <gcr/gcr.h>
 
 #include <libsecret/secret.h>
 
@@ -153,6 +157,7 @@ static void keyring_store_passwords(gpointer key, gpointer value, gpointer user_
 typedef struct auth_ui_data {
 	char *vpn_name;
 	char *vpn_uuid;
+	gboolean connect_urlpath;
 	GHashTable *options;
 	GHashTable *secrets;
 	GHashTable *success_secrets;
@@ -175,6 +180,11 @@ typedef struct auth_ui_data {
 	const char *token_secret;
 
 	int cookie_retval;
+
+	GIOChannel *stdin_channel;
+	GSource *stdin_source;
+	GString *stdin_line;
+	gboolean quit_seen;
 
 	int cancel_pipes[2];
 	gboolean cancelled; /* fully cancel the whole challenge-response series */
@@ -211,6 +221,8 @@ enum {
 static auth_ui_data *_ui_data;
 
 static void connect_host(auth_ui_data *ui_data);
+
+static void write_progress(void *cbdata, int level, const char *fmt, ...);
 
 static void container_child_remove(GtkWidget *widget, gpointer data)
 {
@@ -419,7 +431,7 @@ static gboolean ui_add_select (ui_fragment_data *data)
 	if (g_queue_peek_tail(ui_data->form_entries) == data)
 		gtk_widget_grab_focus (combo);
 	g_signal_connect(G_OBJECT(combo), "changed", G_CALLBACK(combo_changed), data);
-	/* Hook up the 'show' signal to ensure that we override prompts on 
+	/* Hook up the 'show' signal to ensure that we override prompts on
 	   UI elements which may be coming later. */
 	g_signal_connect(G_OBJECT(combo), "show", G_CALLBACK(combo_changed), data);
 
@@ -538,7 +550,7 @@ static gboolean ui_form (struct oc_auth_form *form)
 		data = g_slice_new0 (ui_fragment_data);
 		data->ui_data = ui_data;
 		data->opt = opt;
-		
+
 		if (opt->type == OC_FORM_OPT_PASSWORD ||
 		    opt->type == OC_FORM_OPT_TEXT) {
 			g_mutex_lock (&ui_data->form_mutex);
@@ -588,7 +600,7 @@ static gboolean ui_form (struct oc_auth_form *form)
 	}
 
 	form_autosubmit (ui_data);
-	
+
 	return ui_show(ui_data);
 }
 
@@ -626,6 +638,190 @@ static gboolean set_initial_authgroup (auth_ui_data *ui_data, struct oc_auth_for
 	}
 	return FALSE;
 }
+
+#if OPENCONNECT_CHECK_VER(5,7)
+
+struct WebviewContext {
+	struct openconnect_info *vpninfo;
+	WebKitWebView *webview;
+	const char *login_uri;
+	void *privdata;
+	GMutex mutex;
+	GCond cv;
+	int done;
+};
+
+static void cookie_cb (GObject *source_obj, GAsyncResult *res, gpointer data);
+
+static void load_changed_cb (WebKitWebView *web_view, WebKitLoadEvent load_event, struct WebviewContext *ctx)
+{
+	WebKitCookieManager *cm;
+	const char *uri;
+
+	if (load_event != WEBKIT_LOAD_FINISHED) {
+		return;
+	}
+
+	cm = webkit_web_context_get_cookie_manager(webkit_web_context_get_default());
+	uri = webkit_web_view_get_uri(web_view);
+
+	webkit_cookie_manager_get_cookies(cm, uri, NULL, cookie_cb, ctx);
+}
+
+static void cookie_cb (GObject *source_obj, GAsyncResult *res, gpointer data)
+{
+	struct WebviewContext *ctx = (struct WebviewContext *)data;
+	WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(webkit_web_context_get_default());
+	WebKitWebResource *resource = NULL;
+	WebKitURIResponse *response = NULL;
+	SoupMessageHeaders *headers =  NULL;
+	SoupMessageHeadersIter iter;
+	GList *cookies, *l;
+	char **cookie_array = NULL, **headers_array = NULL;
+	int result, i, num_cookies = 0, num_headers = 0;
+	const char *name, *value, *uri = webkit_web_view_get_uri(ctx->webview);
+
+	cookies = webkit_cookie_manager_get_cookies_finish(cm, res, NULL);
+
+	for (l = cookies; l != NULL; l = l->next) {
+		num_cookies++;
+	}
+
+	cookie_array = calloc(2 * (num_cookies + 1), sizeof(char*) );
+
+	for (l = cookies, i = 0; l != NULL; l = l->next, i+=2) {
+		SoupCookie *cookie = (SoupCookie *)l->data;
+		cookie_array[i] = strdup(soup_cookie_get_name(cookie));
+		cookie_array[i+1] = strdup(soup_cookie_get_value(cookie));
+	}
+	g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
+
+	resource = webkit_web_view_get_main_resource(ctx->webview);
+	if (resource)
+		response = webkit_web_resource_get_response (resource);
+	if (response)
+		headers = webkit_uri_response_get_http_headers (response);
+
+	if (headers) {
+		for (soup_message_headers_iter_init (&iter, headers); soup_message_headers_iter_next (&iter, &name, &value);)
+			num_headers++;
+		headers_array = calloc(2 * (num_headers + 1), sizeof(char *));
+		if (headers_array)
+			for (i = 0, soup_message_headers_iter_init (&iter, headers); soup_message_headers_iter_next (&iter, &name, &value); i+=2) {
+				headers_array[i] = strdup(name);
+				headers_array[i+1] = strdup(value);
+			}
+	}
+
+	result = openconnect_webview_load_changed(ctx->vpninfo,
+						  &(struct oc_webview_result) {
+							  .uri = uri,
+							  .cookies = (const char **)cookie_array,
+							  .headers = (const char **)headers_array,
+						  });
+
+	for (i = 0; cookie_array && i < 2 * (num_cookies + 1); i++) {
+		free(cookie_array[i]);
+	}
+	free(cookie_array);
+
+	for (i = 0; headers_array && i < 2 * (num_headers + 1); i++) {
+		free(headers_array[i]);
+	}
+	free(headers_array);
+
+	if (!result) {
+		g_mutex_lock(&ctx->mutex);
+		ctx->done = 1;
+		g_cond_signal(&ctx->cv);
+		g_mutex_unlock(&ctx->mutex);
+	}
+}
+
+static gboolean open_webview_idle(gpointer data)
+{
+	struct WebviewContext *ctx = (struct WebviewContext *)data;
+	auth_ui_data *ui_data = _ui_data; /* FIXME global */
+	WebKitWebView *webView;
+	WebKitWebsiteDataManager *dm = NULL;
+	WebKitCookieManager *cm = NULL;
+	GString *storage = NULL;
+
+	// Create a browser instance
+	webView = WEBKIT_WEB_VIEW(webkit_web_view_new());
+
+	dm = webkit_web_view_get_website_data_manager(webView);
+	if (dm)
+		cm = webkit_website_data_manager_get_cookie_manager(dm);
+	if (cm)
+		storage = g_string_new (g_get_user_data_dir());
+	if (storage)
+		storage = g_string_append(storage, "/openconnect_saml_cookies");
+	if (storage) {
+		webkit_cookie_manager_set_persistent_storage(cm, storage->str, WEBKIT_COOKIE_PERSISTENT_STORAGE_TEXT);
+		webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
+		g_string_free(storage, TRUE);
+	}
+
+	g_signal_connect(webView, "load-changed", G_CALLBACK(load_changed_cb), ctx);
+	ctx->webview = webView;
+
+	// Put the browser area into the main window
+	gtk_widget_set_size_request(GTK_WIDGET(webView), 640, 480);
+	gtk_box_pack_start(GTK_BOX(ui_data->ssl_box), GTK_WIDGET(webView), FALSE, FALSE, 0);
+	gtk_widget_show_all(ui_data->ssl_box);
+
+	// Load a web page into the browser instance
+	webkit_web_view_load_uri(webView, ctx->login_uri);
+
+	return FALSE;
+}
+
+static int open_webview(struct openconnect_info *vpninfo, const char *login_uri, void *privdata)
+{
+	struct WebviewContext ctx;
+
+	// Webview is incredibly slow with compositing enabled
+	g_setenv ("WEBKIT_DISABLE_COMPOSITING_MODE", "1", FALSE);
+	ctx.vpninfo = vpninfo;
+	ctx.privdata = privdata;
+	g_mutex_init(&ctx.mutex);
+	g_cond_init(&ctx.cv);
+	ctx.login_uri = login_uri;
+	ctx.done = 0;
+
+	g_mutex_lock(&ctx.mutex);
+	g_idle_add(open_webview_idle, &ctx);
+	while (!ctx.done) {
+		g_cond_wait(&ctx.cv, &ctx.mutex);
+	}
+	g_mutex_unlock(&ctx.mutex);
+
+	return 0;
+}
+
+#endif // OPENCONNECT_CHECK_VER(5,7)
+
+#if OPENCONNECT_CHECK_VER(5,8) && GTK_CHECK_VERSION(3,22,0)
+
+static int open_uri(struct openconnect_info *vpninfo, const char *login_uri, void *privdata)
+{
+	GError *err = NULL;
+
+	G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+	gtk_show_uri_on_window(NULL, login_uri, GDK_CURRENT_TIME, &err);
+	G_GNUC_END_IGNORE_DEPRECATIONS
+	if (err) {
+		write_progress(NULL, PRG_ERR, "Failed to invoke GTK.show_uri_on_window.");
+		write_progress(NULL, PRG_ERR, "%s.", err->message);
+		g_error_free(err);
+		return 1;
+	}
+
+	return 0;
+}
+
+#endif // OPENCONNECT_CHECK_VER(5,8) && GTK_CHECK_VERSION(3,22,0)
 
 static int nm_process_auth_form (void *cbdata, struct oc_auth_form *form)
 {
@@ -740,41 +936,101 @@ static char *openconnect_get_cert_details(struct openconnect_info *vpninfo,
 }
 #endif
 
+static void cert_dialog_cancel_clicked (GtkButton *btn, GtkDialog *dlg)
+{
+	gtk_dialog_response(dlg, GTK_RESPONSE_CANCEL);
+}
+
+static void cert_dialog_connect_clicked (GtkButton *btn, GtkDialog *dlg)
+{
+	gtk_dialog_response(dlg, GTK_RESPONSE_OK);
+}
+
 static gboolean user_validate_cert(cert_data *data)
 {
 	auth_ui_data *ui_data = _ui_data; /* FIXME global */
+
+	char *prevent_invalid_cert;
+	gboolean invalid_cert_allowed;
+
+	GtkWidget *dlg;
 	char *title;
-	GtkWidget *dlg, *text, *scroll;
-	GtkTextBuffer *buffer;
+
+	GtkWidget *vbox, *hbox, *expander_hbox;
+
+	char *warning_label_text;
+	GtkWidget *warning_label;
+
+	unsigned char *der_cert;
+	int der_cert_size;
+	GcrCertificate *cert;
+	GcrCertificateWidget *cert_widget;
+
+	GtkWidget *cancel_button;
+	GtkWidget *security_expander;
+	GtkWidget *connect_button;
+
 	int result;
 
 	title = get_title(data->ui_data->vpn_name);
-	dlg = gtk_message_dialog_new(NULL, 0, GTK_MESSAGE_QUESTION,
-				     GTK_BUTTONS_OK_CANCEL,
-	                             _("Certificate from VPN server “%s” failed verification.\n"
-			             "Reason: %s\nDo you want to accept it?"),
-			             openconnect_get_hostname(data->ui_data->vpninfo),
-			             data->reason);
-	gtk_window_set_skip_taskbar_hint(GTK_WINDOW(dlg), FALSE);
-	gtk_window_set_skip_pager_hint(GTK_WINDOW(dlg), FALSE);
+	dlg = gtk_dialog_new();
+	gtk_window_set_modal(GTK_WINDOW(dlg), true);
 	gtk_window_set_title(GTK_WINDOW(dlg), title);
-	gtk_window_set_default_size(GTK_WINDOW(dlg), 550, 600);
-	gtk_window_set_resizable(GTK_WINDOW(dlg), TRUE);
-	gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_CANCEL);
-
+	gtk_window_set_default_size(GTK_WINDOW(dlg), 350, 200);
 	g_free(title);
 
-	scroll = gtk_scrolled_window_new(NULL, NULL);
-	gtk_box_pack_start(GTK_BOX (gtk_dialog_get_content_area(GTK_DIALOG (dlg))), scroll, TRUE, TRUE, 0);
-	gtk_widget_show(scroll);
+	vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+	gtk_box_pack_start(GTK_BOX (gtk_dialog_get_content_area(GTK_DIALOG (dlg))), vbox, TRUE, TRUE, 0);
+	gtk_container_set_border_width(GTK_CONTAINER(vbox), 8);
+	gtk_widget_show(vbox);
 
-	text = gtk_text_view_new();
-	buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text));
-	gtk_text_buffer_set_text(buffer, data->cert_details, -1);
-	gtk_text_view_set_editable(GTK_TEXT_VIEW(text), 0);
-	gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text), FALSE);
-	gtk_container_add(GTK_CONTAINER(scroll), text);
-	gtk_widget_show(text);
+	warning_label_text = g_strconcat(_("<b>The certificate may be invalid or untrusted!</b>\n"),
+									 _("<b>Reason: "), data->reason, ".</b>",
+									 NULL);
+	warning_label = gtk_label_new(NULL);
+	gtk_label_set_markup(GTK_LABEL(warning_label), warning_label_text);
+	gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(warning_label), FALSE, FALSE, 0);
+	gtk_widget_set_halign(warning_label, GTK_ALIGN_START);
+	gtk_label_set_line_wrap(GTK_LABEL(warning_label), true);
+	gtk_widget_show(warning_label);
+	g_free(warning_label_text);
+
+	der_cert_size = openconnect_get_peer_cert_DER(data->ui_data->vpninfo, &der_cert);
+	cert = gcr_simple_certificate_new_static(der_cert, der_cert_size);
+	cert_widget = gcr_certificate_widget_new(cert);
+	gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(cert_widget), FALSE, FALSE, 0);
+	gtk_widget_show(GTK_WIDGET(cert_widget));
+
+	hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+	gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
+	gtk_widget_show(hbox);
+
+	cancel_button = gtk_button_new_with_mnemonic(_("_Cancel"));
+	gtk_box_pack_start(GTK_BOX(hbox), cancel_button, FALSE, FALSE, 0);
+	g_signal_connect(cancel_button, "clicked", G_CALLBACK(cert_dialog_cancel_clicked), dlg);
+	gtk_widget_show(cancel_button);
+
+	prevent_invalid_cert = g_hash_table_lookup(ui_data->options,
+							NM_OPENCONNECT_KEY_PREVENT_INVALID_CERT);
+	invalid_cert_allowed = prevent_invalid_cert ? !strcmp(prevent_invalid_cert, "no") : TRUE;
+
+	if (invalid_cert_allowed) {
+		security_expander = gtk_expander_new(_("I really know what I am doing"));
+		gtk_box_pack_start(GTK_BOX(vbox), security_expander, FALSE, FALSE, 0);
+		gtk_widget_show(security_expander);
+
+		expander_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+		gtk_container_add(GTK_CONTAINER(security_expander), expander_hbox);
+		gtk_container_set_border_width(GTK_CONTAINER(expander_hbox), 0);
+		gtk_widget_show(expander_hbox);
+
+		connect_button = gtk_button_new_with_label(_("Connect anyway"));
+		gtk_box_pack_start(GTK_BOX(expander_hbox), connect_button, FALSE, FALSE, 0);
+		gtk_widget_set_margin_start(connect_button, 12);
+		gtk_widget_set_margin_top(connect_button, 8);
+		g_signal_connect(connect_button, "clicked", G_CALLBACK(cert_dialog_connect_clicked), dlg);
+		gtk_widget_show(connect_button);
+	}
 
 	result = gtk_dialog_run(GTK_DIALOG(dlg));
 
@@ -894,7 +1150,8 @@ static int parse_xmlconfig(gchar *xmlconfig)
 	}
 
 	xml_doc = xmlReadMemory(xmlconfig, strlen(xmlconfig), "noname.xml", NULL, 0);
-
+	if (!xml_doc)
+		return -EIO;
 	xml_node = xmlDocGetRootElement(xml_doc);
 	for (xml_node = xml_node->children; xml_node; xml_node = xml_node->next) {
                 if (xml_node->type == XML_ELEMENT_NODE &&
@@ -959,10 +1216,16 @@ static int get_config (auth_ui_data *ui_data,
 	char *proxy;
 	char *xmlconfig;
 	char *hostname;
-	char *group;
 	char *csd;
+#if OPENCONNECT_CHECK_VER(5,8)
+	char *mcakey, *mcacert, *mca_key_pass;
+#endif
 	char *sslkey, *cert;
 	char *csd_wrapper;
+	char *reported_os;
+#if OPENCONNECT_CHECK_VER(5,5)
+	char *key_pass;
+#endif
 	char *pem_passphrase_fsid;
 	char *cafile;
 	char *token_mode;
@@ -976,16 +1239,10 @@ static int get_config (auth_ui_data *ui_data,
 	}
 
 	/* add gateway to host list */
-	vpnhosts = malloc(sizeof(*vpnhosts));
+	vpnhosts = g_malloc0(sizeof(*vpnhosts));
 	if (!vpnhosts)
 		return -ENOMEM;
 	vpnhosts->hostname = g_strdup(hostname);
-	group = strchr(vpnhosts->hostname, '/');
-	if (group) {
-		*(group++) = 0;
-		vpnhosts->usergroup = g_strdup(group);
-	} else
-		vpnhosts->usergroup = NULL;
 	vpnhosts->hostaddress = g_strdup (hostname);
 	vpnhosts->next = NULL;
 
@@ -1006,17 +1263,20 @@ static int get_config (auth_ui_data *ui_data,
 
 		openconnect_set_xmlsha1 (vpninfo, (char *)sha1_text, strlen(sha1_text) + 1);
 		g_checksum_free(sha1);
-		
+
 		parse_xmlconfig (config_str);
 	}
 
 	protocol = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_PROTOCOL);
-	if (protocol && strcmp(protocol, "anyconnect")) {
 #if OPENCONNECT_CHECK_VER(5,1)
-		if (openconnect_set_protocol(vpninfo, protocol))
+	if (protocol && openconnect_set_protocol(vpninfo, protocol))
+#else
+	if (protocol && strcmp(protocol, "anyconnect"))
 #endif
-			return -EINVAL;
-	}
+		return -EINVAL;
+
+	if (!g_strcmp0(protocol, "pulse"))
+		ui_data->connect_urlpath = TRUE;
 
 	cafile = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_CACERT);
 	if (cafile)
@@ -1033,14 +1293,34 @@ static int get_config (auth_ui_data *ui_data,
 		openconnect_setup_csd(vpninfo, getuid(), 1, OC3DUP (csd_wrapper));
 	}
 
+	reported_os = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_REPORTED_OS);
+	if (reported_os && reported_os[0])
+		openconnect_set_reported_os(vpninfo, reported_os);
+
 	proxy = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_PROXY);
 	if (proxy && proxy[0] && openconnect_set_http_proxy(vpninfo, OC3DUP (proxy)))
 		return -EINVAL;
+
+#if OPENCONNECT_CHECK_VER(5,8)
+	mcacert = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_MCACERT);
+	mcakey  = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_MCAKEY);
+	openconnect_set_mca_cert(vpninfo, OC3DUP(mcacert), OC3DUP(mcakey));
+
+	mca_key_pass = g_hash_table_lookup(options, NM_OPENCONNECT_KEY_MCA_PASS);
+	if (mca_key_pass)
+		openconnect_set_mca_key_password(vpninfo, mca_key_pass);
+#endif
 
 	cert = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_USERCERT);
 	sslkey = g_hash_table_lookup (options, NM_OPENCONNECT_KEY_PRIVKEY);
 	openconnect_set_client_cert (vpninfo, OC3DUP (cert), OC3DUP (sslkey));
 
+#if OPENCONNECT_CHECK_VER(5,5)
+	key_pass = g_hash_table_lookup (options,
+					      NM_OPENCONNECT_KEY_KEY_PASS);
+	if (key_pass)
+		openconnect_set_key_password(vpninfo, key_pass);
+#endif
 	pem_passphrase_fsid = g_hash_table_lookup (options,
 						   NM_OPENCONNECT_KEY_PEM_PASSPHRASE_FSID);
 	if (pem_passphrase_fsid && cert && !strcmp(pem_passphrase_fsid, "yes"))
@@ -1218,6 +1498,66 @@ static void hash_table_merge (GHashTable *old_hash, GHashTable *new_hash)
 	g_hash_table_foreach_steal (old_hash, &hash_merge_one, new_hash);
 }
 
+
+static char *oc_server_url(auth_ui_data *ui_data)
+{
+#if OPENCONNECT_CHECK_VER(5,7)
+	return g_strdup(openconnect_get_connect_url(ui_data->vpninfo));
+#elif OPENCONNECT_CHECK_VER(5,3)
+	/* This is basically what OpenConnect does to create it for us,
+	 * in newer versions. Ideally we wouldn't have to get involved
+	 * in any of this, but for backward compatibiity we can tolerate
+	 * it because it lets us use the --resolve trick, and thus fix
+	 * things for users whose servers need SNI, without having to
+	 * upgrade openconnect first. */
+	const char *dnsname = openconnect_get_dnsname(ui_data->vpninfo);
+	int port = openconnect_get_port(ui_data->vpninfo);
+	const char *urlpath = NULL;
+
+	if (ui_data->connect_urlpath)
+		urlpath = openconnect_get_urlpath(ui_data->vpninfo);
+
+	if (port == 443)
+		return g_strdup_printf("https://%s/%s",
+				       dnsname, urlpath ? urlpath : "");
+	else
+		return g_strdup_printf("https://%s:%d/%s",
+				       dnsname, port, urlpath ? urlpath : "");
+#else
+	/* Prior to OpenConnect v7.07 (API 5.3) openconnect didn't have the
+	 * --resolve argument, so needs the IP address — which confusingly
+	 * is what it returns from openconnect_get_hostname() — in order to
+	 * ensure that it connects to the same server we authenticated to,
+	 * even when round robin or geo DNS would give a different lookup.
+	 *
+	 * This does mean that SNI-based proxies on the server end are going
+	 * to fail to find the right target, for older OpenConnect. */
+	return g_strdup_printf ("%s:%d",
+				openconnect_get_hostname(ui_data->vpninfo),
+				openconnect_get_port(ui_data->vpninfo));
+#endif
+}
+
+static char *oc_server_resolve(struct openconnect_info *vpninfo)
+{
+	/* Versions older than OpenConnect v7.07 (API 5.3) didn't
+	 * support the --resolve argument. Don't confuse them. */
+#if OPENCONNECT_CHECK_VER(5,3)
+	const char *ipaddr = openconnect_get_hostname(vpninfo);
+	const char *dnsname = openconnect_get_dnsname(vpninfo);
+
+	if (g_strcmp0(ipaddr, dnsname)) {
+		/* Strip the [] surrounding IPv6 literals. */
+		int l = strlen(ipaddr);
+		if (ipaddr[0] == '[' && ipaddr[l-1] == ']') {
+			ipaddr++;
+			l -=2;
+		}
+		return g_strdup_printf("%s:%.*s", dnsname, l, ipaddr);
+	}
+#endif
+	return NULL;
+}
 static gboolean cookie_obtained(auth_ui_data *ui_data)
 {
 	ui_data->getting_cookie = FALSE;
@@ -1255,10 +1595,14 @@ static gboolean cookie_obtained(auth_ui_data *ui_data)
 		/* Merge in the three *real* secrets that are actually used
 		   by nm-openconnect-service to make the connection */
 		key = g_strdup (NM_OPENCONNECT_KEY_GATEWAY);
-		value = g_strdup_printf ("%s:%d",
-					 openconnect_get_hostname(ui_data->vpninfo),
-					 openconnect_get_port(ui_data->vpninfo));
+		value = oc_server_url(ui_data);
 		g_hash_table_insert (ui_data->secrets, key, value);
+
+		value = oc_server_resolve(ui_data->vpninfo);
+		if (value) {
+			key = g_strdup (NM_OPENCONNECT_KEY_RESOLVE);
+			g_hash_table_insert (ui_data->secrets, key, value);
+		}
 
 		key = g_strdup (NM_OPENCONNECT_KEY_COOKIE);
 		value = g_strdup (openconnect_get_cookie (ui_data->vpninfo));
@@ -1542,6 +1886,7 @@ static void build_main_dialog(auth_ui_data *ui_data)
 
 static auth_ui_data *init_ui_data (char *vpn_name, GHashTable *options, GHashTable *secrets, char *vpn_uuid)
 {
+	char *vpn_useragent = g_hash_table_lookup(options, NM_OPENCONNECT_KEY_USERAGENT);
 	auth_ui_data *ui_data;
 
 	ui_data = g_slice_new0(auth_ui_data);
@@ -1559,7 +1904,8 @@ static auth_ui_data *init_ui_data (char *vpn_name, GHashTable *options, GHashTab
 							  g_free, g_free);
 	ui_data->success_passwords = g_hash_table_new_full (g_str_hash, g_str_equal,
 							  g_free, keyring_password_free);
-	ui_data->autosubmit = AUTOSUBMIT_LIMIT;
+	if (get_save_passwords (secrets))
+		ui_data->autosubmit = AUTOSUBMIT_LIMIT;
 
 	if (pipe(ui_data->cancel_pipes)) {
 		/* This should never happen, and the world is probably about
@@ -1571,44 +1917,41 @@ static auth_ui_data *init_ui_data (char *vpn_name, GHashTable *options, GHashTab
 	g_unix_set_fd_nonblocking(ui_data->cancel_pipes[0], TRUE, NULL);
 	g_unix_set_fd_nonblocking(ui_data->cancel_pipes[1], TRUE, NULL);
 
-	ui_data->vpninfo = (void *)openconnect_vpninfo_new("OpenConnect VPN Agent (NetworkManager)",
+	/* If it's an empty string, forget it. */
+	if (vpn_useragent && !*vpn_useragent)
+		vpn_useragent = NULL;
+
+	ui_data->vpninfo = (void *)openconnect_vpninfo_new(vpn_useragent ?: "OpenConnect VPN Agent (NetworkManager)",
 							   validate_peer_cert, write_new_config,
 							   nm_process_auth_form, write_progress,
 							   ui_data);
 
+#if OPENCONNECT_CHECK_VER(5,8)
+	/* The useragent provided to openconnect_vpninfo_new() gets the
+	 * OpenConnect version appended to it. But some servers need the
+	 * useragent to *precisely* match a known string; support for
+	 * that was added in OpenConnect 9.00 (API 5.8) with the
+	 * openconnect_set_useragent() function. */
+	if (vpn_useragent)
+		openconnect_set_useragent(ui_data->vpninfo, vpn_useragent);
+
+#if GTK_CHECK_VERSION(3,22,0)
+	openconnect_set_external_browser_callback(ui_data->vpninfo, open_uri);
+#endif
+#endif
+#if OPENCONNECT_CHECK_VER(5,7)
+	openconnect_set_webview_callback(ui_data->vpninfo, open_webview);
+#endif
+
 #if OPENCONNECT_CHECK_VER(1,4)
 	openconnect_set_cancel_fd (ui_data->vpninfo, ui_data->cancel_pipes[0]);
-#endif  
+#endif
 
 #if 0
 	ui_data->vpninfo->proxy_factory = px_proxy_factory_new();
 #endif
 
 	return ui_data;
-}
-
-static void wait_for_quit (void)
-{
-	GString *str;
-	char c;
-	ssize_t n;
-	time_t start;
-
-	str = g_string_sized_new (10);
-	start = time (NULL);
-	do {
-		errno = 0;
-		n = read (0, &c, 1);
-		if (n == 0 || (n < 0 && errno == EAGAIN))
-			g_usleep (G_USEC_PER_SEC / 10);
-		else if (n == 1) {
-			g_string_append_c (str, c);
-			if (strstr (str->str, "QUIT") || (str->len > 10))
-				break;
-		} else
-			break;
-	} while (time (NULL) < start + 20);
-	g_string_free (str, TRUE);
 }
 
 static struct option long_options[] = {
@@ -1637,6 +1980,35 @@ static gpointer init_connection (auth_ui_data *ui_data)
 	return NULL;
 }
 
+static gboolean process_stdin (GIOChannel *source, GIOCondition condition, auth_ui_data *ui_data)
+{
+	gsize count;
+	GIOStatus status;
+	char c;
+
+	while (1) {
+		status = g_io_channel_read_chars(ui_data->stdin_channel, &c, 1, &count, NULL);
+		if (status == G_IO_STATUS_AGAIN)
+			return TRUE;
+		g_return_val_if_fail(status == G_IO_STATUS_NORMAL, FALSE);
+
+		/* Like nm_vpn_service_plugin_read_vpn_details(), treat \0 as \n */
+		if (c == '\0' || c == '\n') {
+			if (!strcmp(ui_data->stdin_line->str, "QUIT")) {
+				ui_data->quit_seen = TRUE;
+				/* Only really quit when called properly from the main loop. */
+				if (condition)
+					gtk_main_quit();
+			}
+			g_string_truncate(ui_data->stdin_line, 0);
+			continue;
+		}
+
+		if (ui_data->stdin_line->len < 10)
+			g_string_append_c(ui_data->stdin_line, c);
+	}
+}
+
 int main (int argc, char **argv)
 {
 	char *vpn_name = NULL, *vpn_uuid = NULL, *vpn_service = NULL;
@@ -1646,6 +2018,12 @@ int main (int argc, char **argv)
 	GThread *init_thread;
 	gchar *key, *value;
 	int opt;
+	int param_fd = dup(1);
+	FILE *paramf = fdopen(param_fd, "w");
+
+	/* We don't want stdout from child processes / logging to confuse NM
+	 * so redirect it to stderr instead. */
+	dup2(2, 1);
 
 	while ((opt = getopt_long(argc, argv, "ru:n:s:i", long_options, NULL))) {
 		if (opt < 0)
@@ -1678,9 +2056,6 @@ int main (int argc, char **argv)
 		}
 	}
 
-	if (!allow_interaction)
-		return 0;
-
 	if (optind != argc) {
 		fprintf(stderr, "Superfluous command line options\n");
 		return 1;
@@ -1711,36 +2086,59 @@ int main (int argc, char **argv)
 		return 1;
 	}
 
+
+	g_unix_set_fd_nonblocking(0, TRUE, NULL);
+	_ui_data->stdin_channel = g_io_channel_unix_new (0);
+	_ui_data->stdin_source = g_io_create_watch(_ui_data->stdin_channel, G_IO_IN);
+	_ui_data->stdin_line = g_string_new("");
+
+	/*
+	 * https://gitlab.gnome.org/GNOME/network-manager-applet/-/issues/179
+	 *
+	 * Some versions of nm-applet send the QUIT immediately along with the
+	 * DONE after the config+secrets. So check for it right now, before
+	 * displaying the dialog. If it's already been sent, ignore it (but
+	 * leave ui_data->quit_seen TRUE so that we don't wait later).
+	 */
+	process_stdin(NULL, 0, _ui_data);
+
+	if (!_ui_data->quit_seen) {
+		g_source_set_callback(_ui_data->stdin_source, (GSourceFunc)process_stdin, _ui_data, NULL);
+		g_source_attach(_ui_data->stdin_source, NULL);
+	}
+
+	if (allow_interaction) {
 #if OPENCONNECT_CHECK_VER(3,4)
-	openconnect_set_token_callbacks (_ui_data->vpninfo, _ui_data, NULL, update_token);
+		openconnect_set_token_callbacks (_ui_data->vpninfo, _ui_data, NULL, update_token);
 #endif
 
-	build_main_dialog(_ui_data);
+		build_main_dialog(_ui_data);
 
-	openconnect_init_ssl();
+		openconnect_init_ssl();
 
-	/* These can't be done until token password handled */
-	gtk_widget_set_sensitive (_ui_data->combo, FALSE);
-	gtk_widget_set_sensitive (_ui_data->connect_button, FALSE);
+		/* These can't be done until token password handled */
+		gtk_widget_set_sensitive (_ui_data->combo, FALSE);
+		gtk_widget_set_sensitive (_ui_data->connect_button, FALSE);
 
-	init_thread = g_thread_new("init_connection", (GThreadFunc)init_connection, _ui_data);
-	g_thread_unref(init_thread);
+		init_thread = g_thread_new("init_connection", (GThreadFunc)init_connection, _ui_data);
+		g_thread_unref(init_thread);
 
-	gtk_window_present(GTK_WINDOW(_ui_data->dialog));
-	gtk_main();
-
-	if (!g_hash_table_size (_ui_data->secrets))
-		return 0;
+		gtk_window_present(GTK_WINDOW(_ui_data->dialog));
+		gtk_main();
+	}
 
 	/* Dump all secrets to stdout */
-	g_hash_table_iter_init (&iter, _ui_data->secrets);
-	while (g_hash_table_iter_next (&iter, (gpointer *)&key,
-				       (gpointer *)&value))
-		printf("%s\n%s\n", key, value);
-	printf("\n\n");
-	fflush(stdout);
+	if (g_hash_table_size (_ui_data->secrets) > 0) {
+		g_hash_table_iter_init (&iter, _ui_data->secrets);
+		while (g_hash_table_iter_next (&iter, (gpointer *)&key, (gpointer *)&value))
+			fprintf(paramf, "%s\n%s\n", key, value);
+	}
 
-	wait_for_quit ();
+	fprintf(paramf, "\n\n");
+	fflush(paramf);
+
+	if (!_ui_data->quit_seen)
+		gtk_main();
 
 	return 0;
 }
