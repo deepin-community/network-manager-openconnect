@@ -1,3 +1,9 @@
+network-manager-openconnect (1.2.10-2deepin1) unstable; urgency=medium
+
+  * add add debian/patches/deepin-bug-63126-hide-auth-dialog.patch.
+
+ -- LiChengGang <lichenggang@uniontech.com>  Thu, 04 Jan 2024 16:57:02 +0800
+
 network-manager-openconnect (1.2.10-2) unstable; urgency=medium
 
   [ Luca Boccassi ]
