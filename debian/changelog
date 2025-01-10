@@ -1,8 +1,9 @@
-network-manager-openconnect (1.2.10-2deepin1) unstable; urgency=medium
+network-manager-openconnect (1.2.10-3) unstable; urgency=medium
 
-  * add add debian/patches/deepin-bug-63126-hide-auth-dialog.patch.
+  [ Jeremy Bícha ]
+  * Build with webkit2gtk 4.1 instead of 4.0 (Closes: #1061397)
 
- -- LiChengGang <lichenggang@uniontech.com>  Thu, 04 Jan 2024 16:57:02 +0800
+ -- Luca Boccassi <bluca@debian.org>  Wed, 24 Jan 2024 00:11:43 +0000
 
 network-manager-openconnect (1.2.10-2) unstable; urgency=medium
 
